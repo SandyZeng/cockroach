@@ -492,6 +492,54 @@ bool MergeTimeSeriesValues(cockroach::proto::Value *left, const cockroach::proto
     return true;
 }
 
+// ConsolidateTimeSeriesValue processes a single value which contain
+// InternalTimeSeriesData messages. This method will sort the sample collection
+// of the value, combining any samples with duplicate offsets. This method is
+// the single-value equivalent of MergeTimeSeriesValues, and is used in the case
+// where the first value is merged into the key. Returns true if the merge is
+// successful.
+bool ConsolidateTimeSeriesValue(cockroach::proto::Value *val, rocksdb::Logger* logger) {
+    // Attempt to parse TimeSeriesData from both Values.
+    cockroach::proto::InternalTimeSeriesData val_ts;
+    if (!val_ts.ParseFromString(val->bytes())) {
+        rocksdb::Warn(logger,
+                "InternalTimeSeriesData could not be parsed from bytes.");
+        return false;
+    }
+
+    // Initialize new_ts and its primitive data fields.
+    cockroach::proto::InternalTimeSeriesData new_ts;
+    new_ts.set_start_timestamp_nanos(val_ts.start_timestamp_nanos());
+    new_ts.set_sample_duration_nanos(val_ts.sample_duration_nanos());
+
+    // Sort values in the ts value. 
+    std::sort(val_ts.mutable_samples()->pointer_begin(),
+            val_ts.mutable_samples()->pointer_end(),
+            TimeSeriesSampleOrdering);
+
+    // Merge sample values of left and right into new_ts.
+    auto front = val_ts.samples().begin(),
+         end = val_ts.samples().end();
+
+    // Loop until samples have been exhausted.
+    while(front != end) {
+        // Create an empty sample in the output collection with the selected
+        // offset.  Accumulate data from all samples at the front of the sample
+        // collection which match the selected timestamp. This behavior is
+        // needed because even a single value may have duplicated offsets. 
+        cockroach::proto::InternalTimeSeriesSample* ns = new_ts.add_samples();
+        ns->set_offset(front->offset());
+        while (front != end && front->offset() == ns->offset()) {
+            AccumulateTimeSeriesSamples(ns, *front);
+            front++;
+        }
+    }
+
+    // Serialize the new TimeSeriesData into the value's byte field.
+    new_ts.SerializeToString(val->mutable_bytes());
+    return true;
+}
+
 bool MergeValues(cockroach::proto::Value *left, const cockroach::proto::Value &right,
         bool full_merge, rocksdb::Logger* logger) {
     if (left->has_bytes()) {
@@ -531,6 +579,9 @@ bool MergeValues(cockroach::proto::Value *left, const cockroach::proto::Value &r
         return true;
     } else {
         *left = right;
+        if (full_merge && IsTimeSeriesData(left)) {
+            ConsolidateTimeSeriesValue(left, logger);
+        }
         return true;
     }
 }
